@@ -10,20 +10,26 @@ Usage:
     fetch-lyrics ~/Music
     fetch-lyrics ~/Music --force              # overwrite existing .lrc
     fetch-lyrics ~/Music --dry-run            # fetch, write nothing
+    fetch-lyrics ~/Music --embed              # also write lyrics into tags
+    fetch-lyrics ~/Music --jobs 4             # parallel workers
+    fetch-lyrics --retry-misses               # only re-try missed files
     fetch-lyrics ~/Music --sources LRCLIB,lyrics.ovh
     fetch-lyrics ~/Music --min-score 0.8
     fetch-lyrics ~/Music --m3u playlist.m3u   # also accept m3u path(s)
 
-Reads no player config; writes only .lrc files beside your audio.
+Reads no player config; writes .lrc files beside your audio (and, with
+--embed, lyrics tags inside the audio file itself).
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import configparser
 import difflib
 import json
 import re
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -173,6 +179,85 @@ def existing_lrc(path: Path) -> Path | None:
         if f.is_file() and f.stem == path.stem and f.suffix.lower() == ".lrc":
             return f
     return None
+
+
+# ---------------------------------------------------------------- throttle
+
+_THROTTLE = {"t": 0.0, "lock": threading.Lock()}
+
+
+def throttle(delay: float) -> None:
+    """Space out request starts across threads by `delay` seconds."""
+    if delay <= 0:
+        return
+    with _THROTTLE["lock"]:
+        now = time.monotonic()
+        wait = _THROTTLE["t"] + delay - now
+        if wait > 0:
+            time.sleep(wait)
+        _THROTTLE["t"] = time.monotonic()
+
+
+# ---------------------------------------------------------------- embed
+
+LRC_TS = re.compile(r"^\[(\d+):(\d+(?:[.:]\d+)?)\]\s*(.*)$")
+
+
+def lrc_entries(synced: str) -> list[tuple[str, int]]:
+    """Parse LRC into [(text, milliseconds)] for SYLT (sorted by time)."""
+    out = []
+    for line in (synced or "").splitlines():
+        m = LRC_TS.match(line.strip())
+        if not m:
+            continue
+        mm, ss, txt = m.group(1), m.group(2).replace(":", "."), m.group(3).strip()
+        if not txt:
+            continue
+        ms = int(mm) * 60000 + int(round(float(ss) * 1000))
+        out.append((txt, ms))
+    out.sort(key=lambda e: e[1])
+    return out
+
+
+def embed_lyrics(path: Path, plain: str, synced: str) -> str:
+    """Write lyrics into the audio file's tags. Returns ok/skip/none/err."""
+    if MutagenFile is None:
+        return "none"
+    body = synced or plain
+    if not body:
+        return "skip"
+    ext = path.suffix.lower()
+    try:
+        if ext == ".mp3":
+            from mutagen.id3 import ID3, ID3NoHeaderError, SYLT, USLT
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags.delall("SYLT")
+            tags.delall("USLT")
+            if synced:
+                entries = lrc_entries(synced)
+                if entries:
+                    tags.add(SYLT(encoding=3, lang="eng", format=2, type=1, text=entries))
+            tags.add(USLT(encoding=3, lang="eng", desc="", text=body))
+            tags.save(path)
+            return "ok"
+        m = MutagenFile(path)
+        if m is None or m.tags is None:
+            return "skip"
+        if ext in (".m4a", ".m4b", ".mp4", ".aac"):
+            m["\xa9lyr"] = [body]
+            m.save()
+            return "ok"
+        if hasattr(m.tags, "__setitem__"):  # vorbis comments (flac/ogg/opus)
+            key = "LYRICS" if synced else "UNSYNCEDLYRICS"
+            m.tags[key] = [body]
+            m.save()
+            return "ok"
+    except Exception:
+        return "err"
+    return "skip"
 
 
 # ---------------------------------------------------------------- sources
@@ -382,7 +467,7 @@ def main() -> int:
         prog="fetch-lyrics",
         description="Batch-fetch .lrc lyrics for a folder of music (LRCLIB / lyrics.ovh).",
     )
-    ap.add_argument("paths", nargs="+", type=Path,
+    ap.add_argument("paths", nargs="*", type=Path,
                     help="folders (or audio files) to scan")
     ap.add_argument("--m3u", action="append", default=[], type=Path,
                     help="also read audio paths from an .m3u playlist (repeatable)")
@@ -402,7 +487,16 @@ def main() -> int:
                     help="config file (default: ~/.config/fetch-lyrics/config)")
     ap.add_argument("--no-config", action="store_true",
                     help="ignore the config file")
+    ap.add_argument("--embed", action="store_true",
+                    help="also write lyrics into the audio file tags (needs mutagen)")
+    ap.add_argument("--jobs", type=int, default=1, metavar="N",
+                    help="parallel fetch workers (default: 1)")
+    ap.add_argument("--retry-misses", nargs="?", const="lyrics-misses.txt", default=None, metavar="FILE",
+                    help="only re-try paths listed in FILE (default: lyrics-misses.txt)")
     args = ap.parse_args()
+
+    if not args.paths and not args.m3u and not args.retry_misses:
+        ap.error("give at least one path, --m3u FILE, or --retry-misses")
 
     conf = {}
     if not args.no_config:
@@ -420,46 +514,85 @@ def main() -> int:
         print(f"unknown source(s): {', '.join(bad)}. valid: {', '.join(sorted(valid))}", file=sys.stderr)
         return 2
 
-    for p in args.paths:
+    roots = list(args.paths)
+    for p in roots:
         if not p.exists():
             print(f"not found: {p}", file=sys.stderr)
             return 2
 
-    files = collect_files(args.paths, args.m3u, not args.no_recursive)
+    if args.retry_misses:
+        rf = Path(args.retry_misses)
+        if not rf.is_file():
+            print(f"miss file not found: {rf}", file=sys.stderr)
+            return 2
+        for line in rf.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            q = Path(line)
+            if q.is_file() and q.suffix.lower() in AUDIO_EXT:
+                roots.append(q)
+
+    files = collect_files(roots, args.m3u, not args.no_recursive)
     todo = [p for p in files if args.force or existing_lrc(p) is None]
 
+    embed_note = " embed=True" if args.embed else ""
     print(f"files={len(files)} to_fetch={len(todo)} "
-          f"sources={','.join(sources)} dry_run={args.dry_run}")
+          f"sources={','.join(sources)} jobs={args.jobs}{embed_note} dry_run={args.dry_run}")
+
+    if args.embed and MutagenFile is None:
+        print("warning: --embed needs mutagen (pip install mutagen); continuing without embedding.",
+              file=sys.stderr)
 
     done = skipped = missed = 0
     misses: list[str] = []
-    for i, path in enumerate(todo, 1):
+    total = len(todo)
+    seq = {"i": 0}
+
+    def work(path: Path):
+        throttle(delay)
         artist, title, album, dur = read_tags(path)
         if not artist and not title:
-            missed += 1
-            misses.append(str(path))
-            print(f"[{i}/{len(todo)}] NO-META  {path.name}")
-            continue
-
+            return "NO-META", path, "", ""
         plain, synced, _label = find_lyrics(artist, title, album, dur, sources, min_score)
         text = synced or plain
         if not text:
+            return "MISS", path, f"{artist} - {title}", ""
+        target = path.with_suffix(".lrc")  # SAME stem as the audio file
+        kind = "synced" if synced else "plain "
+        if not args.dry_run:
+            target.write_text(text.rstrip() + "\n", encoding="utf-8")
+            if args.embed:
+                embed_lyrics(path, plain, synced)
+        return "OK", path, kind, target.name
+
+    def handle(res) -> None:
+        nonlocal done, missed
+        status, path, info, name = res
+        seq["i"] += 1
+        i = seq["i"]
+        if status == "OK":
+            done += 1
+            arrow = "" if args.dry_run else "-> "
+            print(f"[{i}/{total}] OK {info} {arrow}{name}")
+        elif status == "NO-META":
             missed += 1
             misses.append(str(path))
-            print(f"[{i}/{len(todo)}] MISS     {artist} - {title}")
-            continue
-
-        kind = "synced" if synced else "plain "
-        target = path.with_suffix(".lrc")  # SAME stem as the audio file
-        if args.dry_run:
-            print(f"[{i}/{len(todo)}] OK {kind} {target.name}")
+            print(f"[{i}/{total}] NO-META  {path.name}")
         else:
-            target.write_text(text.rstrip() + "\n", encoding="utf-8")
-            print(f"[{i}/{len(todo)}] OK {kind} -> {target.name}")
-        done += 1
-        time.sleep(delay)
+            missed += 1
+            misses.append(str(path))
+            print(f"[{i}/{total}] MISS     {info}")
 
-    print(f"SUMMARY written={done} skipped_existing={skipped} not_found={missed} total={len(todo)}")
+    if args.jobs > 1 and total > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+            for res in ex.map(work, todo):
+                handle(res)
+    else:
+        for path in todo:
+            handle(work(path))
+
+    print(f"SUMMARY written={done} skipped_existing={skipped} not_found={missed} total={total}")
     if misses:
         report = Path("lyrics-misses.txt")
         report.write_text("\n".join(misses) + "\n", encoding="utf-8")

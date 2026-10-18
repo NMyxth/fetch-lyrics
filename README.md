@@ -23,6 +23,8 @@ No API key or account is needed for either source. The only header sent is a
 - **No packages required.**
 - `mutagen` is optional. With it, tags are read properly (artist, title, album,
   duration). Without it, the artist/title are parsed from the filename.
+- `mutagen` is **required only** for `--embed` (writing lyrics into the audio
+  file's tags).
 
 ## Install
 
@@ -46,6 +48,9 @@ fetch-lyrics ~/Music --force            # overwrite existing .lrc
 fetch-lyrics ~/Music --sources LRCLIB,lyrics.ovh
 fetch-lyrics ~/Music --min-score 0.8
 fetch-lyrics ~/Music --delay 0.6        # seconds between requests
+fetch-lyrics ~/Music --embed            # also embed lyrics into the audio tags
+fetch-lyrics ~/Music --jobs 4           # fetch with 4 parallel workers
+fetch-lyrics --retry-misses             # only re-try paths in lyrics-misses.txt
 fetch-lyrics ~/Music --no-recursive
 fetch-lyrics ~/Music --m3u playlist.m3u
 ```
@@ -59,6 +64,9 @@ fetch-lyrics ~/Music --m3u playlist.m3u
 | `--sources A,B` | Source order (default `LRCLIB,lyrics.ovh`) |
 | `--min-score N` | Minimum match score for the fuzzy fallback |
 | `--delay S` | Delay between requests |
+| `--embed` | Also write lyrics into the audio file tags (needs mutagen) |
+| `--jobs N` | Parallel fetch workers (default `1`) |
+| `--retry-misses [FILE]` | Only re-try paths listed in `FILE` (default `lyrics-misses.txt`) |
 | `--no-recursive` | Do not descend into subfolders |
 | `--m3u FILE` | Also read paths from an m3u playlist (repeatable) |
 | `--config FILE` | Config file (default `~/.config/fetch-lyrics/config`) |
@@ -93,16 +101,26 @@ Tracks that already have a sibling `.lrc` are skipped unless `--force`.
 - Prints a `SUMMARY written=.. skipped_existing=.. not_found=.. total=..`.
 - Writes the not-found paths to `./lyrics-misses.txt`.
 
+With `--embed`, lyrics are also written into the audio file itself:
+
+- **MP3** — `USLT` (plain) plus `SYLT` (synced, when available).
+- **FLAC / OGG / Opus** — `LYRICS` (synced) or `UNSYNCEDLYRICS` (plain).
+- **M4A / MP4** — `©lyr`.
+
+Files that already have lyrics are overwritten only with `--force`.
+
 ## Notes
 
 - Rate limits are per requesting IP; the default delay keeps you under LRCLIB's.
+- With `--jobs N`, requests are still spaced by `--delay`; raise the delay if you
+  see `429`/`503` retries.
 - LRCLIB and lyrics.ovh are public, keyless endpoints. If they change or go down,
   matching quality drops but nothing breaks.
 
 ## About
 
-This project was **generated with AI** (vibe-coded). The maintainer does not write
-code by hand; it is shared as-is, best-effort.
+This project was **generated with AI** (vibe-coded). It started as a personal tool and
+was shared as-is; the maintainer does not write code by hand. Best-effort.
 
 ## License
 
