@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""fetch-lyrics - batch-fetch .lrc lyrics for a folder of music.
+
+Sources: LRCLIB (synced), lyrics.ovh (plain).
+The output .lrc always has the SAME stem as the audio file, beside it, so
+your local music/media player reads it. Alternate/cleaned titles are used for
+the search only, never for the filename.
+
+Usage:
+    fetch-lyrics ~/Music
+    fetch-lyrics ~/Music --force              # overwrite existing .lrc
+    fetch-lyrics ~/Music --dry-run            # fetch, write nothing
+    fetch-lyrics ~/Music --sources LRCLIB,lyrics.ovh
+    fetch-lyrics ~/Music --min-score 0.8
+    fetch-lyrics ~/Music --m3u playlist.m3u   # also accept m3u path(s)
+
+Reads no player config; writes only .lrc files beside your audio.
+"""
+from __future__ import annotations
+
+import argparse
+import configparser
+import difflib
+import json
+import re
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+try:
+    from mutagen import File as MutagenFile
+except ImportError:
+    MutagenFile = None
+
+AUDIO_EXT = {
+    ".flac", ".mp3", ".m4a", ".m4b", ".ogg", ".opus",
+    ".wav", ".wv", ".ape", ".aac", ".aiff",
+}
+AGENT = "fetch-lyrics/1.0"
+DEFAULT_SOURCES = "LRCLIB,lyrics.ovh"
+DEFAULT_MIN_SCORE = 0.70
+DEFAULT_DELAY = 0.4
+
+NOISE_KEYS = [
+    "official", "lyric", "video", "audio", "visualizer", "remaster", "topic",
+    "lirik", "terjemahan", "indonesia", "music video", "prod.", "from the",
+    "hd", "4k", "mv", "sped up", "slowed", "nightcore", "reverb",
+]
+BRACKETS = re.compile(r"[\(\[]\s*([^\)\]]*?)\s*[\)\]]")
+
+
+# ---------------------------------------------------------------- helpers
+
+class _Resp:
+    """Minimal response object (status_code / headers / json)."""
+
+    __slots__ = ("status_code", "headers", "_body")
+
+    def __init__(self, status_code: int, headers: dict, body: bytes):
+        self.status_code = status_code
+        self.headers = headers
+        self._body = body
+
+    def json(self):
+        return json.loads(self._body.decode("utf-8", "replace"))
+
+
+def http_get(url: str, params: dict | None = None, timeout: int = 20, tries: int = 5):
+    """GET with retry on 429/5xx and network errors. Returns a response or None."""
+    if params:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{urllib.parse.urlencode(params)}"
+    for n in range(tries):
+        req = urllib.request.Request(url, headers={"User-Agent": AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return _Resp(r.status, dict(r.headers), r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+            except Exception:  # noqa: BLE001
+                body = b""
+            if e.code == 200:
+                return _Resp(200, dict(e.headers or {}), body)
+            if e.code in (429, 502, 503, 504):
+                ra = (e.headers or {}).get("Retry-After")
+                wait = float(ra) if ra and str(ra).isdigit() else 3 + n * 3
+                print(f"    rate-limited ({e.code}), sleeping {wait:.0f}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            return _Resp(e.code, dict(e.headers or {}), body)
+        except Exception:  # noqa: BLE001
+            time.sleep(1 + n)
+    return None
+
+
+def clean(name: str) -> str:
+    """Strip YouTube-style noise from an artist/title string."""
+    s = name or ""
+    s = BRACKETS.sub(
+        lambda m: " " if any(k in m.group(1).lower() for k in NOISE_KEYS) else m.group(0),
+        s,
+    )
+    s = re.sub(r"\s*[-\u2013]\s*(super )?(slowed|sped up|speed up|nightcore|reverb|remix)\b.*$",
+               "", s, flags=re.I)
+    s = re.sub(r"\b(official( music)? video|official audio|lyric video|lyrics?|visualizer|audio|mv|topic)\b",
+               " ", s, flags=re.I)
+    s = re.sub(r"\b(lirik|terjemahan|indonesia)\b", " ", s, flags=re.I)
+    s = re.sub(r"[_\s]+", " ", s)
+    return s.strip(" -\u2013|.,")
+
+
+def norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def sim(a: str, b: str) -> float:
+    a, b = norm(a), norm(b)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def artist_variants(artist: str) -> list[str]:
+    """Split multi-artist tags ('A/B', 'A, B', 'A & B') into single names."""
+    out: list[str] = []
+    for part in re.split(r"[/,;&]", artist or ""):
+        part = part.strip()
+        if part and part not in out:
+            out.append(part)
+    return out
+
+
+def read_tags(path: Path) -> tuple[str, str, str, int]:
+    artist = title = album = ""
+    dur = 0
+    if MutagenFile is not None:
+        try:
+            m = MutagenFile(path, easy=True)
+            if m is not None:
+                artist = (m.get("artist") or [""])[0] or ""
+                title = (m.get("title") or [""])[0] or ""
+                album = (m.get("album") or [""])[0] or ""
+                if getattr(m, "info", None) is not None:
+                    dur = int(m.info.length or 0)
+        except Exception:
+            pass
+    if not title:
+        stem = path.stem
+        if " - " in stem:
+            a, t = stem.split(" - ", 1)
+            artist = artist or a.strip()
+            title = t.strip()
+        else:
+            title = stem.strip()
+    # empty artist: pull "Artist - Title" out of the title
+    if not artist and " - " in title:
+        a, t = title.split(" - ", 1)
+        artist, title = a.strip(), t.strip()
+    return artist.strip(), title.strip(), album.strip(), dur
+
+
+def existing_lrc(path: Path) -> Path | None:
+    """Case-insensitive sibling .lrc with the same stem."""
+    for f in path.parent.iterdir():
+        if f.is_file() and f.stem == path.stem and f.suffix.lower() == ".lrc":
+            return f
+    return None
+
+
+# ---------------------------------------------------------------- sources
+
+def src_lrclib_get(artist: str, title: str) -> tuple[str, str]:
+    r = http_get("https://lrclib.net/api/get",
+                 {"track_name": title, "artist_name": artist})
+    if r is not None and r.status_code == 200:
+        try:
+            j = r.json()
+            return j.get("plainLyrics") or "", j.get("syncedLyrics") or ""
+        except Exception:
+            return "", ""
+    return "", ""
+
+
+def src_lrclib_search(artist: str, title: str, album: str, dur: int,
+                      min_score: float) -> tuple[str, str] | None:
+    p = {}
+    if title:
+        p["track_name"] = title
+    if artist:
+        p["artist_name"] = artist
+    if album:
+        p["album_name"] = album
+    if not p:
+        return None
+    r = http_get("https://lrclib.net/api/search", p)
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    best = None
+    bs = -1.0
+    bas = 0.0
+    for c in data:
+        a_s = sim(artist, c.get("artistName", ""))
+        t_s = sim(title, c.get("trackName", ""))
+        sc = t_s * 0.6 + a_s * 0.4
+        cd = c.get("duration")
+        if dur and cd and abs(dur - cd) <= 3:
+            sc += 0.15
+        if sc > bs:
+            bs, bas, best = sc, a_s, c
+    if best and bs >= min_score and (not artist or bas >= 0.35):
+        return best.get("plainLyrics") or "", best.get("syncedLyrics") or ""
+    return None
+
+
+def src_lrclib_q(query: str, title: str, dur: int, min_score: float) -> tuple[str, str] | None:
+    """Free-text LRCLIB search. Requires a strong title match to avoid wrong hits."""
+    q = (query or "").strip()
+    if not q:
+        return None
+    floor = max(min_score, 0.85)
+    r = http_get("https://lrclib.net/api/search", {"q": q})
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    best = None
+    bs = -1.0
+    for c in data:
+        cd = c.get("duration")
+        if dur and cd and abs(dur - cd) > 3:
+            continue  # title match alone is not enough
+        sc = sim(title, c.get("trackName", ""))
+        if dur and cd and abs(dur - cd) <= 3:
+            sc += 0.15
+        if sc > bs:
+            bs, best = sc, c
+    if best and bs >= floor:
+        return best.get("plainLyrics") or "", best.get("syncedLyrics") or ""
+    return None
+
+
+def src_ovh(artist: str, title: str) -> str:
+    if not artist or not title:
+        return ""
+    r = http_get(f"https://api.lyrics.ovh/v1/{urllib.parse.quote(artist)}/{urllib.parse.quote(title)}")
+    if r is not None and r.status_code == 200:
+        try:
+            return r.json().get("lyrics", "") or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def find_lyrics(artist: str, title: str, album: str, dur: int,
+                sources: list[str], min_score: float) -> tuple[str, str, str]:
+    """Return (plain, synced, source_label)."""
+    plain = synced = ""
+    ca, ct = clean(artist), clean(title)
+
+    if "LRCLIB" in sources:
+        seen: list[str] = []
+        for a in artist_variants(artist) + ([ca] if ca else []):
+            if a and a not in seen:
+                seen.append(a)
+        for t in [title, ct]:
+            if not t:
+                continue
+            for a in (seen or [""]):
+                p, s = src_lrclib_get(a.strip(), t.strip())
+                if p or s:
+                    if s:
+                        return p, s, "LRCLIB/get"
+                    plain, synced = p, ""
+                    break
+            if plain or synced:
+                break
+        if not (plain or synced):
+            for a in (seen or [""]):
+                res = src_lrclib_search(a, ct, album, dur, min_score)
+                if res:
+                    plain, synced = res
+                    if synced:
+                        break
+        if not (plain or synced):
+            for a in seen:
+                res = src_lrclib_q(f"{a} {ct}".strip() if ct else a, title or ct, dur, min_score)
+                if res:
+                    plain, synced = res
+                    if synced:
+                        break
+        if not (plain or synced) and ct:
+            res = src_lrclib_q(ct, title or ct, dur, min_score)
+            if res:
+                plain, synced = res
+
+    if not (plain or synced) and "lyrics.ovh" in sources:
+        ly = src_ovh(ca, ct)
+        if ly:
+            plain, synced = ly, ""
+
+    label = "LRCLIB" if synced else ("LRCLIB" if plain else "")
+    return plain, synced, label
+
+
+# ---------------------------------------------------------------- input
+
+def collect_files(roots: list[Path], m3us: list[Path], recursive: bool) -> list[Path]:
+    out: list[Path] = []
+    for root in roots:
+        if root.is_file() and root.suffix.lower() in AUDIO_EXT:
+            out.append(root)
+        elif root.is_dir():
+            it = root.rglob("*") if recursive else root.glob("*")
+            out.extend(p for p in it if p.is_file() and p.suffix.lower() in AUDIO_EXT)
+    for m in m3us:
+        for line in m.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            p = Path(line)
+            if not p.is_absolute():
+                p = (m.parent / p).resolve()
+            if p.is_file() and p.suffix.lower() in AUDIO_EXT:
+                out.append(p)
+    # dedupe, keep order
+    seen = set()
+    uniq = []
+    for p in out:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return sorted(uniq)
+
+
+# ---------------------------------------------------------------- main
+
+def load_config(path: Path) -> dict:
+    """Read the optional INI config. Returns {} if absent or broken."""
+    if not path.is_file():
+        return {}
+    cp = configparser.ConfigParser()
+    try:
+        cp.read(path)
+    except Exception as e:  # noqa: BLE001
+        print(f"warning: cannot read config {path}: {e}", file=sys.stderr)
+        return {}
+    if not cp.has_section("defaults"):
+        return {}
+    sec = cp["defaults"]
+    out = {}
+    if sec.get("sources"):
+        out["sources"] = sec.get("sources")
+    try:
+        if sec.get("min_score") is not None:
+            out["min_score"] = sec.getfloat("min_score")
+        if sec.get("delay") is not None:
+            out["delay"] = sec.getfloat("delay")
+    except ValueError as e:
+        print(f"warning: bad number in config: {e}", file=sys.stderr)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="fetch-lyrics",
+        description="Batch-fetch .lrc lyrics for a folder of music (LRCLIB / lyrics.ovh).",
+    )
+    ap.add_argument("paths", nargs="+", type=Path,
+                    help="folders (or audio files) to scan")
+    ap.add_argument("--m3u", action="append", default=[], type=Path,
+                    help="also read audio paths from an .m3u playlist (repeatable)")
+    ap.add_argument("--no-recursive", action="store_true",
+                    help="only scan the top level of each folder")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite existing .lrc files")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="fetch and report, write nothing")
+    ap.add_argument("--sources", default=None,
+                    help=f"comma list in order (default: {DEFAULT_SOURCES})")
+    ap.add_argument("--min-score", type=float, default=None,
+                    help=f"min match score for the search fallback (default: {DEFAULT_MIN_SCORE})")
+    ap.add_argument("--delay", type=float, default=None,
+                    help=f"seconds between tracks (default: {DEFAULT_DELAY})")
+    ap.add_argument("--config", type=Path, default=None,
+                    help="config file (default: ~/.config/fetch-lyrics/config)")
+    ap.add_argument("--no-config", action="store_true",
+                    help="ignore the config file")
+    args = ap.parse_args()
+
+    conf = {}
+    if not args.no_config:
+        cpath = args.config if args.config else (Path.home() / ".config" / "fetch-lyrics" / "config")
+        conf = load_config(cpath)
+
+    sources_str = args.sources or conf.get("sources") or DEFAULT_SOURCES
+    min_score = args.min_score if args.min_score is not None else conf.get("min_score", DEFAULT_MIN_SCORE)
+    delay = args.delay if args.delay is not None else conf.get("delay", DEFAULT_DELAY)
+
+    sources = [s.strip() for s in sources_str.split(",") if s.strip()]
+    valid = {"LRCLIB", "lyrics.ovh"}
+    bad = [s for s in sources if s not in valid]
+    if bad:
+        print(f"unknown source(s): {', '.join(bad)}. valid: {', '.join(sorted(valid))}", file=sys.stderr)
+        return 2
+
+    for p in args.paths:
+        if not p.exists():
+            print(f"not found: {p}", file=sys.stderr)
+            return 2
+
+    files = collect_files(args.paths, args.m3u, not args.no_recursive)
+    todo = [p for p in files if args.force or existing_lrc(p) is None]
+
+    print(f"files={len(files)} to_fetch={len(todo)} "
+          f"sources={','.join(sources)} dry_run={args.dry_run}")
+
+    done = skipped = missed = 0
+    misses: list[str] = []
+    for i, path in enumerate(todo, 1):
+        artist, title, album, dur = read_tags(path)
+        if not artist and not title:
+            missed += 1
+            misses.append(str(path))
+            print(f"[{i}/{len(todo)}] NO-META  {path.name}")
+            continue
+
+        plain, synced, _label = find_lyrics(artist, title, album, dur, sources, min_score)
+        text = synced or plain
+        if not text:
+            missed += 1
+            misses.append(str(path))
+            print(f"[{i}/{len(todo)}] MISS     {artist} - {title}")
+            continue
+
+        kind = "synced" if synced else "plain "
+        target = path.with_suffix(".lrc")  # SAME stem as the audio file
+        if args.dry_run:
+            print(f"[{i}/{len(todo)}] OK {kind} {target.name}")
+        else:
+            target.write_text(text.rstrip() + "\n", encoding="utf-8")
+            print(f"[{i}/{len(todo)}] OK {kind} -> {target.name}")
+        done += 1
+        time.sleep(delay)
+
+    print(f"SUMMARY written={done} skipped_existing={skipped} not_found={missed} total={len(todo)}")
+    if misses:
+        report = Path("lyrics-misses.txt")
+        report.write_text("\n".join(misses) + "\n", encoding="utf-8")
+        print(f"miss list -> {report.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
