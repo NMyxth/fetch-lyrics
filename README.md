@@ -28,10 +28,8 @@ No API key or account is needed for either source. The only header sent is a
 
 ## Install
 
-One-liner (no dependencies):
-
 ```sh
-curl -fsSL https://raw.githubusercontent.com/NMyxth/fetch-lyrics/main/fetch-lyrics \
+curl -fsSL https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics \
   -o ~/.local/bin/fetch-lyrics && chmod +x ~/.local/bin/fetch-lyrics
 ```
 
