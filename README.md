@@ -28,6 +28,10 @@ No API key or account is needed for either source. The only header sent is a
 
 ## Install
 
+### macOS / Linux
+
+One command:
+
 ```sh
 curl -fsSL https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics \
   -o ~/.local/bin/fetch-lyrics && chmod +x ~/.local/bin/fetch-lyrics
@@ -42,25 +46,41 @@ Python is required (`py --version`; install from [python.org](https://www.python
 or the Microsoft Store if missing). The script is standard-library only, so no
 packages are needed.
 
-Download it as a `.py` file and run it with the Python launcher:
+Download both files into the same folder:
 
 ```powershell
 irm https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics.py -OutFile fetch-lyrics.py
+irm https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics.cmd -OutFile fetch-lyrics.cmd
 ```
+
+Then run it:
 
 ```powershell
-py -3 fetch-lyrics.py "$env:USERPROFILE\Music"
+.\fetch-lyrics.cmd "$env:USERPROFILE\Music"
 ```
 
-For a bare `fetch-lyrics` command, also download `fetch-lyrics.cmd` from the
-[repo](https://github.com/NMyxth/fetch-lyrics) and put it next to `fetch-lyrics.py`,
-then add that folder to your `PATH`.
+Add that folder to your `PATH` for a bare `fetch-lyrics` command. Keep
+`fetch-lyrics.py` and `fetch-lyrics.cmd` in the same folder.
 
 Notes:
 
 - `--embed` needs mutagen: `py -m pip install mutagen`.
 - If you see a `UnicodeEncodeError`, run `chcp 65001` first, or set `PYTHONUTF8=1`.
 - `.lrc` files are always written as UTF-8.
+
+### From source (clone)
+
+Any OS, if you prefer git:
+
+```sh
+git clone https://github.com/NMyxth/fetch-lyrics.git
+cd fetch-lyrics
+./fetch-lyrics ~/Music
+```
+
+On Windows use the launcher instead: `.\fetch-lyrics.cmd "$env:USERPROFILE\Music"`.
+
+Update anytime with `git pull` — there is no build step and no dependencies.
 
 ## Usage
 
