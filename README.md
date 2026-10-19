@@ -38,16 +38,6 @@ curl -fsSL https://github.com/NMyxth/fetch-lyrics/releases/latest/download/insta
 
 Then open a new terminal and run `fetch-lyrics ~/Music`.
 
-Or do it manually:
-
-```sh
-curl -fsSL https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics \
-  -o ~/.local/bin/fetch-lyrics && chmod +x ~/.local/bin/fetch-lyrics
-```
-
-Make sure `~/.local/bin` is on your `PATH`. The script filename **is** the command
-(like `yt-dlp`); there is no alias.
-
 ### Windows
 
 Python is required (`py --version`; install from [python.org](https://www.python.org/downloads/)
@@ -62,22 +52,6 @@ iwr -useb https://github.com/NMyxth/fetch-lyrics/releases/latest/download/instal
 ```
 
 Open a **new** terminal, then run `fetch-lyrics "$env:USERPROFILE\Music"`.
-
-Or do it manually. Download both files into the same folder:
-
-```powershell
-irm https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics.py -OutFile fetch-lyrics.py
-irm https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics.cmd -OutFile fetch-lyrics.cmd
-```
-
-Then run it:
-
-```powershell
-.\fetch-lyrics.cmd "$env:USERPROFILE\Music"
-```
-
-Add that folder to your `PATH` for a bare `fetch-lyrics` command. Keep
-`fetch-lyrics.py` and `fetch-lyrics.cmd` in the same folder.
 
 Notes:
 
