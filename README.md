@@ -30,7 +30,15 @@ No API key or account is needed for either source. The only header sent is a
 
 ### macOS / Linux
 
-One command:
+Quick install (installs to `~/.local/bin` and adds it to your `PATH` for you):
+
+```sh
+curl -fsSL https://github.com/NMyxth/fetch-lyrics/releases/latest/download/install.sh | sh
+```
+
+Then open a new terminal and run `fetch-lyrics ~/Music`.
+
+Or do it manually:
 
 ```sh
 curl -fsSL https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics \
@@ -46,7 +54,16 @@ Python is required (`py --version`; install from [python.org](https://www.python
 or the Microsoft Store if missing). The script is standard-library only, so no
 packages are needed.
 
-Download both files into the same folder:
+Quick install (installs to `%LOCALAPPDATA%\Programs\fetch-lyrics` and adds it to
+your `PATH` for you):
+
+```powershell
+iwr -useb https://github.com/NMyxth/fetch-lyrics/releases/latest/download/install.ps1 | iex
+```
+
+Open a **new** terminal, then run `fetch-lyrics "$env:USERPROFILE\Music"`.
+
+Or do it manually. Download both files into the same folder:
 
 ```powershell
 irm https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics.py -OutFile fetch-lyrics.py
