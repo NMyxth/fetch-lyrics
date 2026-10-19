@@ -36,6 +36,32 @@ curl -fsSL https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch
 Make sure `~/.local/bin` is on your `PATH`. The script filename **is** the command
 (like `yt-dlp`); there is no alias.
 
+### Windows
+
+Python is required (`py --version`; install from [python.org](https://www.python.org/downloads/)
+or the Microsoft Store if missing). The script is standard-library only, so no
+packages are needed.
+
+Download it as a `.py` file and run it with the Python launcher:
+
+```powershell
+irm https://github.com/NMyxth/fetch-lyrics/releases/latest/download/fetch-lyrics.py -OutFile fetch-lyrics.py
+```
+
+```powershell
+py -3 fetch-lyrics.py "$env:USERPROFILE\Music"
+```
+
+For a bare `fetch-lyrics` command, also download `fetch-lyrics.cmd` from the
+[repo](https://github.com/NMyxth/fetch-lyrics) and put it next to `fetch-lyrics.py`,
+then add that folder to your `PATH`.
+
+Notes:
+
+- `--embed` needs mutagen: `py -m pip install mutagen`.
+- If you see a `UnicodeEncodeError`, run `chcp 65001` first, or set `PYTHONUTF8=1`.
+- `.lrc` files are always written as UTF-8.
+
 ## Usage
 
 ```sh
