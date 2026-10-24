@@ -13,6 +13,8 @@ Usage:
     fetch-lyrics ~/Music --embed              # also write lyrics into tags
     fetch-lyrics ~/Music --jobs 4             # parallel workers
     fetch-lyrics --retry-misses               # only re-try missed files
+    fetch-lyrics -i                           # interactive: search or browse
+    fetch-lyrics --search "artist - title"    # print LRCLIB matches, no prompt
     fetch-lyrics ~/Music --sources LRCLIB,lyrics.ovh
     fetch-lyrics ~/Music --min-score 0.8
     fetch-lyrics ~/Music --m3u playlist.m3u   # also accept m3u path(s)
@@ -27,6 +29,8 @@ import concurrent.futures
 import configparser
 import difflib
 import json
+import os
+import random
 import re
 import sys
 import threading
@@ -46,10 +50,11 @@ AUDIO_EXT = {
     ".flac", ".mp3", ".m4a", ".m4b", ".ogg", ".opus",
     ".wav", ".wv", ".ape", ".aac", ".aiff",
 }
-AGENT = "fetch-lyrics/1.0"
+AGENT = "fetch-lyrics/1.0 (+https://github.com/NMyxth/fetch-lyrics)"
+VERSION = "1.0.3"
 DEFAULT_SOURCES = "LRCLIB,lyrics.ovh"
 DEFAULT_MIN_SCORE = 0.70
-DEFAULT_DELAY = 0.4
+DEFAULT_DELAY = 0.6
 
 NOISE_KEYS = [
     "official", "lyric", "video", "audio", "visualizer", "remaster", "topic",
@@ -76,14 +81,19 @@ class _Resp:
 
 
 def http_get(url: str, params: dict | None = None, timeout: int = 20, tries: int = 5):
-    """GET with retry on 429/5xx and network errors. Returns a response or None."""
+    """GET with adaptive pacing and retry on 429/5xx. Returns a response or None."""
     if params:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}{urllib.parse.urlencode(params)}"
+    if not breaker_ok(url):
+        return None
     for n in range(tries):
+        pace_wait()
         req = urllib.request.Request(url, headers={"User-Agent": AGENT})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
+                pace_result(True)
+                breaker_reset(url)
                 return _Resp(r.status, dict(r.headers), r.read())
         except urllib.error.HTTPError as e:
             try:
@@ -91,16 +101,27 @@ def http_get(url: str, params: dict | None = None, timeout: int = 20, tries: int
             except Exception:  # noqa: BLE001
                 body = b""
             if e.code == 200:
+                pace_result(True)
+                breaker_reset(url)
                 return _Resp(200, dict(e.headers or {}), body)
             if e.code in (429, 502, 503, 504):
+                pace_result(False)
+                wait = min(30.0, float(2 ** n))  # 1, 2, 4, 8, 16
                 ra = (e.headers or {}).get("Retry-After")
-                wait = float(ra) if ra and str(ra).isdigit() else 3 + n * 3
-                print(f"    rate-limited ({e.code}), sleeping {wait:.0f}s", file=sys.stderr)
+                if ra and str(ra).isdigit():
+                    wait = max(wait, min(30.0, float(ra)))
+                wait += random.uniform(0, 0.4)
+                print(f"    {e.code}, backing off {wait:.1f}s (gap {pace_now():.1f}s)",
+                      file=sys.stderr)
                 time.sleep(wait)
                 continue
+            pace_result(True)
+            breaker_reset(url)
             return _Resp(e.code, dict(e.headers or {}), body)
         except Exception:  # noqa: BLE001
-            time.sleep(1 + n)
+            pace_result(False)
+            time.sleep(min(8.0, float(2 ** n)) + random.uniform(0, 0.3))
+    breaker_trip(url)
     return None
 
 
@@ -185,6 +206,15 @@ def existing_lrc(path: Path) -> Path | None:
 
 _THROTTLE = {"t": 0.0, "lock": threading.Lock()}
 
+# Adaptive pacing: `--delay` is the floor. The gap grows on 429/503 and decays
+# back down after a run of clean responses, so a healthy run stays quick and a
+# rough one slows itself down instead of hammering the API.
+_PACE = {"floor": DEFAULT_DELAY, "cur": DEFAULT_DELAY, "clean": 0, "lock": threading.Lock()}
+PACE_MAX = 3.0
+PACE_STEP = 0.5
+PACE_DECAY = 0.1
+PACE_CLEAN_RUN = 10
+
 
 def throttle(delay: float) -> None:
     """Space out request starts across threads by `delay` seconds."""
@@ -196,6 +226,72 @@ def throttle(delay: float) -> None:
         if wait > 0:
             time.sleep(wait)
         _THROTTLE["t"] = time.monotonic()
+
+
+def set_delay(floor: float) -> None:
+    """Set the starting gap between HTTP requests (`--delay`)."""
+    with _PACE["lock"]:
+        _PACE["floor"] = max(0.0, floor)
+        _PACE["cur"] = max(0.0, floor)
+        _PACE["clean"] = 0
+
+
+def pace_wait() -> None:
+    """Hold every request `cur` seconds apart, wherever it came from."""
+    with _PACE["lock"]:
+        cur = _PACE["cur"]
+    throttle(cur)
+
+
+def pace_result(ok: bool) -> None:
+    """Slow down after a rate-limit, speed back up after a clean run."""
+    with _PACE["lock"]:
+        if ok:
+            _PACE["clean"] += 1
+            if _PACE["clean"] >= PACE_CLEAN_RUN and _PACE["cur"] > _PACE["floor"]:
+                _PACE["cur"] = max(_PACE["floor"], round(_PACE["cur"] - PACE_DECAY, 2))
+                _PACE["clean"] = 0
+        else:
+            _PACE["clean"] = 0
+            _PACE["cur"] = min(PACE_MAX, round(_PACE["cur"] + PACE_STEP, 2))
+
+
+def pace_now() -> float:
+    with _PACE["lock"]:
+        return _PACE["cur"]
+
+
+# Circuit breaker: when a host fails a whole request twice in a row, stop
+# calling it for a minute instead of burning a backoff cycle on every track.
+_BREAKER: dict[str, dict] = {}
+BREAKER_AFTER = 2
+BREAKER_COOL = 60.0
+
+
+def breaker_host(url: str) -> str:
+    return urllib.parse.urlsplit(url).netloc
+
+
+def breaker_ok(url: str) -> bool:
+    st = _BREAKER.get(breaker_host(url))
+    return not (st and st["until"] > time.monotonic())
+
+
+def breaker_reset(url: str) -> None:
+    st = _BREAKER.get(breaker_host(url))
+    if st:
+        st["fails"] = 0
+
+
+def breaker_trip(url: str) -> None:
+    host = breaker_host(url)
+    st = _BREAKER.setdefault(host, {"fails": 0, "until": 0.0})
+    st["fails"] += 1
+    if st["fails"] >= BREAKER_AFTER:
+        st["until"] = time.monotonic() + BREAKER_COOL
+        st["fails"] = 0
+        print(f"    {host} keeps failing, skipping it for {BREAKER_COOL:.0f}s",
+              file=sys.stderr)
 
 
 # ---------------------------------------------------------------- embed
@@ -434,6 +530,304 @@ def collect_files(roots: list[Path], m3us: list[Path], recursive: bool) -> list[
     return sorted(uniq)
 
 
+# ---------------------------------------------------------------- interactive
+
+_COLOR = (
+    sys.stdout.isatty()
+    and (os.name != "nt" or bool(os.environ.get("WT_SESSION") or os.environ.get("TERM_PROGRAM")))
+)
+
+
+def _c(code: str, text: str) -> str:
+    """ANSI colour when the terminal can take it, plain text otherwise."""
+    return f"\033[{code}m{text}\033[0m" if _COLOR else str(text)
+
+
+def _ask(prompt: str) -> str | None:
+    """One prompt. None means Ctrl+C / Ctrl+D, so the caller backs out."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_name(s: str, limit: int = 120) -> str:
+    s = _BAD_CHARS.sub("_", s or "")
+    s = re.sub(r"\s+", " ", s).strip().strip(".")
+    return s[:limit] or "lyrics"
+
+
+def fmt_dur(sec) -> str:
+    try:
+        s = int(sec)
+    except (TypeError, ValueError):
+        return "--:--"
+    return f"{s // 60}:{s % 60:02d}" if s > 0 else "--:--"
+
+
+def kind_of(entry: dict) -> str:
+    if entry.get("instrumental"):
+        return "instrumental"
+    if entry.get("syncedLyrics"):
+        return "synced"
+    if entry.get("plainLyrics"):
+        return "plain"
+    return "none"
+
+
+def lrclib_search(query: str, limit: int = 10) -> list[dict]:
+    r = http_get("https://lrclib.net/api/search", {"q": query})
+    if r is None or r.status_code != 200:
+        return []
+    try:
+        data = r.json()
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    hits = [c for c in data if isinstance(c, dict)][:limit]
+    q = norm(query)
+    junk = re.compile(r"official|video|audio|lyrics|remix|cover|live|tribute", re.I)
+
+    def rank(c: dict) -> tuple:
+        text = norm(f"{c.get('artistName') or ''} {c.get('trackName') or ''}")
+        score = sim(q, text)
+        if junk.search(f"{c.get('artistName') or ''} {c.get('trackName') or ''}"):
+            score -= 0.08
+        if not (c.get("syncedLyrics") or c.get("plainLyrics")):
+            score -= 0.20
+        return (not bool(c.get("syncedLyrics")), -score)
+
+    return sorted(hits, key=rank)
+
+
+def print_result_row(i: int, c: dict) -> None:
+    album = c.get("albumName") or ""
+    row = (f"  {i:>2}  {c.get('artistName') or '?'} - {c.get('trackName') or '?'}"
+           f"  [{fmt_dur(c.get('duration'))}] {kind_of(c)}")
+    print(row + (f"  {_c('2', album)}" if album else ""))
+
+
+def print_search(query: str) -> int:
+    """--search: print matches and stop (no prompt)."""
+    results = lrclib_search(query)
+    if not results:
+        print("no results", file=sys.stderr)
+        return 1
+    for i, c in enumerate(results, 1):
+        print_result_row(i, c)
+    return 0
+
+
+def show_lyrics(text: str, n: int = 8) -> None:
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    for ln in lines[:n]:
+        print("   " + _c("2", ln))
+    if len(lines) > n:
+        print("   " + _c("2", f"... ({len(lines) - n} more lines)"))
+
+
+def save_lrc(text: str, artist: str, title: str, out_dir: Path, force: bool,
+             dry_run: bool) -> str:
+    artist = (artist or "").strip()
+    title = (title or "").strip()
+    # LRCLIB titles often already carry the artist ("Adele - Hello"); don't double it.
+    if artist and title.lower().startswith(artist.lower()):
+        name = safe_name(title)
+    elif artist and title:
+        name = f"{safe_name(artist)} - {safe_name(title)}"
+    else:
+        name = safe_name(title or artist)
+    target = out_dir / f"{name}.lrc"
+    if dry_run:
+        return f"dry-run: would write {target}"
+    if target.exists() and not force:
+        ans = _ask(f"  {target.name} exists, overwrite? [y/N]: ")
+        if ans is None or ans.strip().lower() not in ("y", "yes"):
+            return "kept the existing file"
+    try:
+        target.write_text(text.rstrip() + "\n", encoding="utf-8")
+    except OSError as e:
+        return f"error: {e}"
+    return f"saved {target}"
+
+
+def fetch_file(path: Path, sources: list[str], min_score: float,
+               embed: bool, dry_run: bool) -> tuple[str, str, str]:
+    """Fetch lyrics for one audio file. Returns (status, info, lrc name)."""
+    artist, title, album, dur = read_tags(path)
+    if not artist and not title:
+        return "NO-META", "", ""
+    plain, synced, _label = find_lyrics(artist, title, album, dur, sources, min_score)
+    text = synced or plain
+    if not text:
+        return "MISS", (f"{artist} - {title}" if artist else title), ""
+    target = path.with_suffix(".lrc")  # SAME stem as the audio file
+    if not dry_run:
+        target.write_text(text.rstrip() + "\n", encoding="utf-8")
+        if embed:
+            embed_lyrics(path, plain, synced)
+    return "OK", "synced" if synced else "plain ", target.name
+
+
+def fetch_batch(paths: list[Path], sources: list[str], min_score: float,
+                embed: bool, dry_run: bool) -> None:
+    ok = miss = 0
+    total = len(paths)
+    for i, p in enumerate(paths, 1):
+        status, info, name = fetch_file(p, sources, min_score, embed, dry_run)
+        if status == "OK":
+            ok += 1
+            print(f"  [{i}/{total}] OK {info} -> {name}")
+        elif status == "NO-META":
+            miss += 1
+            print(f"  [{i}/{total}] NO-META  {p.name}")
+        else:
+            miss += 1
+            print(f"  [{i}/{total}] MISS     {info}")
+    print(f"  done: {ok} written, {miss} missed")
+
+
+def parse_picks(s: str, n: int) -> list[int] | None:
+    """'1,3-5' -> [1,3,4,5]. None when anything is out of range."""
+    out: list[int] = []
+    for part in re.split(r"[,\s]+", s.strip()):
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if not (a.isdigit() and b.isdigit()):
+                return None
+            out.extend(range(int(a), int(b) + 1))
+        elif part.isdigit():
+            out.append(int(part))
+        else:
+            return None
+    if not out or any(i < 1 or i > n for i in out):
+        return None
+    return sorted(set(out))
+
+
+def interactive_search(out_dir: Path, force: bool, dry_run: bool) -> None:
+    while True:
+        q = _ask(f"\n{_c('1', 'Search')} artist / title (empty = back): ")
+        if q is None or not q.strip():
+            return
+        results = lrclib_search(q.strip())
+        if not results:
+            print("  no LRCLIB hits -- try 'artist - title'")
+            continue
+        print()
+        for i, c in enumerate(results, 1):
+            print_result_row(i, c)
+        pick = _ask(f"  pick 1-{len(results)} (b = back, r = search again): ")
+        if pick is None:
+            return
+        pick = pick.strip().lower()
+        if pick in ("", "b", "back"):
+            return
+        if pick in ("r", "s", "search"):
+            continue
+        if not pick.isdigit() or not (1 <= int(pick) <= len(results)):
+            print("  invalid choice")
+            continue
+
+        c = results[int(pick) - 1]
+        synced = c.get("syncedLyrics") or ""
+        plain = c.get("plainLyrics") or ""
+        if not (synced or plain):
+            print("  that entry has no lyrics text")
+            continue
+        print()
+        show_lyrics(synced or plain)
+        hint = ("  [s] save synced  [p] save plain  [b] back: " if (synced and plain)
+                else "  [s] save  [b] back: ")
+        act = _ask(hint)
+        if act is None:
+            return
+        act = act.strip().lower()
+        if act in ("b", "back"):
+            continue
+        text = plain if (act in ("p", "plain") and plain) else (synced or plain)
+        msg = save_lrc(text, c.get("artistName") or "", c.get("trackName") or "",
+                       out_dir, force, dry_run)
+        print("  " + _c("32", msg))
+        return
+
+
+def interactive_folder(sources, min_score, embed, force: bool,
+                       dry_run: bool, recursive: bool) -> None:
+    raw = _ask(f"\n{_c('1', 'Folder')} [{Path.cwd()}]: ")
+    if raw is None:
+        return
+    root = Path(raw.strip().strip('"') or ".").expanduser()
+    if not root.is_dir():
+        print(f"  not a folder: {root}")
+        return
+    files = collect_files([root], [], recursive)
+    if not files:
+        print("  no audio files found")
+        return
+    missing = [p for p in files if force or existing_lrc(p) is None]
+    print(f"\n  {len(files)} audio file(s), {len(missing)} without .lrc\n")
+    for i, p in enumerate(files, 1):
+        if i > 200:
+            print(f"  ... {len(files) - 200} more (still pickable by number)")
+            break
+        try:
+            rel = p.relative_to(root)
+        except ValueError:
+            rel = p
+        has = existing_lrc(p) is not None and not force
+        mark = _c("32", "has .lrc") if has else _c("33", "missing")
+        print(f"  {i:>3}  {rel}  {mark}")
+    ans = _ask("\n  [a] fetch all missing   [1,3-5] pick   [b] back: ")
+    if ans is None:
+        return
+    ans = ans.strip().lower()
+    if ans in ("", "b", "back"):
+        return
+    if ans in ("a", "all"):
+        chosen = missing
+    else:
+        picks = parse_picks(ans, len(files))
+        if picks is None:
+            print("  invalid selection")
+            return
+        chosen = [files[i - 1] for i in picks]
+    if not chosen:
+        print("  nothing to fetch")
+        return
+    print()
+    fetch_batch(chosen, sources, min_score, embed, dry_run)
+
+
+def interactive(sources, min_score, out_dir: Path, force: bool,
+                dry_run: bool, embed: bool, recursive: bool) -> int:
+    print(_c("1", "\nfetch-lyrics") + _c("2", "  interactive"))
+    while True:
+        print()
+        print(_c("1", "  1") + "  Search a song")
+        print(_c("1", "  2") + "  Browse a music folder")
+        print(_c("1", "  3") + "  Quit")
+        ans = _ask("\n> ")
+        if ans is None:
+            return 0
+        ans = ans.strip().lower()
+        if ans in ("1", "s", "search"):
+            interactive_search(out_dir, force, dry_run)
+        elif ans in ("2", "f", "folder"):
+            interactive_folder(sources, min_score, embed, force, dry_run, recursive)
+        elif ans in ("3", "q", "quit", "exit"):
+            return 0
+        elif ans:
+            print("  pick 1, 2 or 3")
+
+
 # ---------------------------------------------------------------- main
 
 def load_config(path: Path) -> dict:
@@ -482,9 +876,11 @@ def main() -> int:
     ap.add_argument("--min-score", type=float, default=None,
                     help=f"min match score for the search fallback (default: {DEFAULT_MIN_SCORE})")
     ap.add_argument("--delay", type=float, default=None,
-                    help=f"seconds between tracks (default: {DEFAULT_DELAY})")
+                    help=f"starting gap between requests, in seconds; grows on "
+                         f"429/503 (default: {DEFAULT_DELAY})")
     ap.add_argument("--config", type=Path, default=None,
                     help="config file (default: ~/.config/fetch-lyrics/config)")
+    ap.add_argument("--version", action="version", version=f"fetch-lyrics {VERSION}")
     ap.add_argument("--no-config", action="store_true",
                     help="ignore the config file")
     ap.add_argument("--embed", action="store_true",
@@ -493,10 +889,13 @@ def main() -> int:
                     help="parallel fetch workers (default: 1)")
     ap.add_argument("--retry-misses", nargs="?", const="lyrics-misses.txt", default=None, metavar="FILE",
                     help="only re-try paths listed in FILE (default: lyrics-misses.txt)")
+    ap.add_argument("-i", "--interactive", action="store_true",
+                    help="interactive mode: search a song or browse a folder")
+    ap.add_argument("--search", metavar="QUERY", default=None,
+                    help="print LRCLIB matches for QUERY and exit (no prompt)")
+    ap.add_argument("-o", "--out", type=Path, default=None, metavar="DIR",
+                    help="interactive: folder for downloaded .lrc files (default: cwd)")
     args = ap.parse_args()
-
-    if not args.paths and not args.m3u and not args.retry_misses:
-        ap.error("give at least one path, --m3u FILE, or --retry-misses")
 
     conf = {}
     if not args.no_config:
@@ -506,6 +905,7 @@ def main() -> int:
     sources_str = args.sources or conf.get("sources") or DEFAULT_SOURCES
     min_score = args.min_score if args.min_score is not None else conf.get("min_score", DEFAULT_MIN_SCORE)
     delay = args.delay if args.delay is not None else conf.get("delay", DEFAULT_DELAY)
+    set_delay(delay)
 
     sources = [s.strip() for s in sources_str.split(",") if s.strip()]
     valid = {"LRCLIB", "lyrics.ovh"}
@@ -513,6 +913,29 @@ def main() -> int:
     if bad:
         print(f"unknown source(s): {', '.join(bad)}. valid: {', '.join(sorted(valid))}", file=sys.stderr)
         return 2
+
+    if args.search is not None:
+        return print_search(args.search)
+
+    # Bare `fetch-lyrics` on a real terminal opens the menu. Piped stdin keeps
+    # the usage error, so scripts never hang waiting for a prompt.
+    if (not args.paths and not args.m3u and not args.retry_misses
+            and not args.interactive and sys.stdin.isatty()):
+        args.interactive = True
+
+    if args.interactive:
+        out_dir = (args.out or Path.cwd()).expanduser()
+        if not args.dry_run:
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"cannot create {out_dir}: {e}", file=sys.stderr)
+                return 2
+        return interactive(sources, min_score, out_dir, args.force,
+                           args.dry_run, args.embed, not args.no_recursive)
+
+    if not args.paths and not args.m3u and not args.retry_misses:
+        ap.error("give at least one path, --m3u FILE, or --retry-misses")
 
     roots = list(args.paths)
     for p in roots:
@@ -550,21 +973,9 @@ def main() -> int:
     seq = {"i": 0}
 
     def work(path: Path):
-        throttle(delay)
-        artist, title, album, dur = read_tags(path)
-        if not artist and not title:
-            return "NO-META", path, "", ""
-        plain, synced, _label = find_lyrics(artist, title, album, dur, sources, min_score)
-        text = synced or plain
-        if not text:
-            return "MISS", path, f"{artist} - {title}", ""
-        target = path.with_suffix(".lrc")  # SAME stem as the audio file
-        kind = "synced" if synced else "plain "
-        if not args.dry_run:
-            target.write_text(text.rstrip() + "\n", encoding="utf-8")
-            if args.embed:
-                embed_lyrics(path, plain, synced)
-        return "OK", path, kind, target.name
+        status, info, name = fetch_file(path, sources, min_score,
+                                        args.embed, args.dry_run)
+        return status, path, info, name
 
     def handle(res) -> None:
         nonlocal done, missed
